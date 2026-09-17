@@ -1,0 +1,20 @@
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+.*.d
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Userspace utility
+/tools/boardctl
+
+# Editor temporary files
+*~
+*.swp
+*.swo
+
+# Keep the kernel .config tracked: it is a project deliverable.
