@@ -3,6 +3,8 @@
 
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/net.h>
 #include <linux/types.h>
@@ -94,6 +96,18 @@ struct board_ctx {
 
 	/* Адрес объекта устройства в ядре; это не указатель на файл в /dev. */
 	struct device *device;
+
+	/* Таймер назначает периодическую работу в общей очереди. */
+	struct hrtimer tx_timer;
+
+	/* Один объект работы повторно используется для отправки статуса. */
+	struct work_struct tx_work;
+
+	/*
+	 * Интервал для обработчика таймера.
+	 * Изменяем только при остановленном таймере.
+	 */
+	ktime_t tx_interval;
 };
 
 /* Единственный экземпляр определён в main.c; остальные файлы используют его. */

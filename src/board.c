@@ -81,12 +81,26 @@ int vb_board_apply_command(const struct board_command *command)
 		break;
 
 	case VB_CMD_START:
-		/* Разрешаем CAN-уведомления о температурных переходах. */
+		/* Повторный start сохраняет уже назначенный срок. */
+		if (next.state == VB_STATE_RUNNING)
+			break;
+
 		next.state = VB_STATE_RUNNING;
+
+		/* Первый вызов callback произойдёт через заданный интервал. */
+		hrtimer_start(&board.tx_timer, board.tx_interval,
+			      HRTIMER_MODE_REL);
 		break;
 
 	case VB_CMD_STOP:
-		/* Температуру и пределы сохраняем для локального контроля. */
+		/*
+		 * Ждём завершения callback, чтобы он больше
+		 * не мог поставить периодическую работу.
+		 */
+		hrtimer_cancel(&board.tx_timer);
+
+		/* Ожидающая работа пропустит отправку после сохранения stopped.
+		 */
 		next.state = VB_STATE_STOPPED;
 		break;
 

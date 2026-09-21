@@ -1,6 +1,8 @@
 #include <linux/completion.h>
 #include <linux/container_of.h>
 #include <linux/errno.h>
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -18,6 +20,53 @@ struct board_request {
 	int result;
 	struct completion done;
 };
+
+/*
+ * Выполняется в общей последовательной очереди вместе с командами.
+ * Отправляет актуальный снимок только при разрешённой передаче.
+ */
+static void vb_periodic_work(struct work_struct *work)
+{
+	struct board_ctx *ctx;
+	struct board_state snapshot;
+	int ret;
+
+	/* Ядро передаёт адрес tx_work, вложенного в контекст платы. */
+	ctx = container_of(work, struct board_ctx, tx_work);
+
+	/* Копируем все поля под блокировкой, отправляем после её снятия. */
+	mutex_lock(&ctx->state_lock);
+	snapshot = ctx->status;
+	mutex_unlock(&ctx->state_lock);
+
+	/* Поставленная ранее работа могла дождаться выполнения stop. */
+	if (snapshot.state != VB_STATE_RUNNING)
+		return;
+
+	ret = vb_can_send_status(&snapshot);
+	if (ret)
+		pr_err("virtual_board: periodic CAN status failed: %d\n", ret);
+}
+
+/*
+ * По истечении интервала поручаем отправку рабочему потоку.
+ * Здесь не берём mutex и не вызываем отправку через сокет.
+ */
+static enum hrtimer_restart vb_timer_callback(struct hrtimer *timer)
+{
+	struct board_ctx *ctx;
+
+	ctx = container_of(timer, struct board_ctx, tx_timer);
+
+	/* Уже ожидающая работа не добавляется в очередь повторно. */
+	queue_work(ctx->wq, &ctx->tx_work);
+
+	/* Переносим срок вперёд, не воспроизводя пропущенные периоды. */
+	hrtimer_forward_now(timer, ctx->tx_interval);
+
+	/* Просим ядро повторно поставить таймер на обновлённый срок. */
+	return HRTIMER_RESTART;
+}
 
 /* Рабочий поток ядра вызывает эту функцию для одной поставленной заявки. */
 static void vb_command_work(struct work_struct *work)
@@ -87,13 +136,26 @@ int vb_worker_init(void)
 		return -ENOMEM;
 	}
 
+	/* Сохраняем обработчик; работа пока не поставлена в очередь. */
+	INIT_WORK(&board.tx_work, vb_periodic_work);
+
+	/* Начальное состояние уже подготовлено, команд ещё нет. */
+	board.tx_interval = ms_to_ktime(board.status.period_ms);
+
+	/* Подготавливаем таймер, но не назначаем срок срабатывания. */
+	hrtimer_init(&board.tx_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	board.tx_timer.function = vb_timer_callback;
+
 	return 0;
 }
 
 /* Вызывается после успешного init, когда новые работы уже исключены. */
 void vb_worker_exit(void)
 {
-	/* Ждём завершения принятых работ перед освобождением очереди. */
+	/* Прекращаем срабатывания и ждём текущий обработчик таймера. */
+	hrtimer_cancel(&board.tx_timer);
+
+	/* Завершаем работы, включая поставленную последним срабатыванием. */
 	destroy_workqueue(board.wq);
 
 	/* Освобождённый объект больше нельзя использовать через этот адрес. */
