@@ -1,13 +1,13 @@
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/kdev_t.h>
+#include <linux/kstrtox.h>
 #include <linux/module.h>
 #include <linux/printk.h>
-#include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
-#include <linux/kstrtox.h>
 
 #include "board.h"
 
@@ -16,90 +16,120 @@
  * После успеха он содержит полную копию ввода с завершающим нулём.
  */
 static int vb_copy_command(char *command, const char __user *user_buf,
-    size_t count)
+			   size_t count)
 {
-    /* Длинную команду отклоняем целиком, не обрезая её смысл. */
-  	if (count > VB_COMMAND_MAX_LEN)
-  		return -E2BIG;
+	/* Длинную команду отклоняем целиком, не обрезая её смысл. */
+	if (count > VB_COMMAND_MAX_LEN)
+		return -E2BIG;
 
-  	/* Не выполняем команду, если удалось получить лишь часть данных. */
-  	if (copy_from_user(command, user_buf, count))
-  		return -EFAULT;
+	/* Не выполняем команду, если удалось получить лишь часть данных. */
+	if (copy_from_user(command, user_buf, count))
+		return -EFAULT;
 
-  	/* Пользовательский NUL не должен скрывать оставшуюся часть ввода. */
-  	if (memchr(command, '\0', count))
-  		return -EINVAL;
+	/* Пользовательский NUL не должен скрывать оставшуюся часть ввода. */
+	if (memchr(command, '\0', count))
+		return -EINVAL;
 
-  	command[count] = '\0';
-  	return 0;
+	command[count] = '\0';
+	return 0;
 }
 
 static int vb_parse_command(char *command, struct board_command *parsed)
 {
-    char *args[3]; /* Название команды и не более двух аргументов. */
-  	char *cursor = command;
-  	char *token;
-  	size_t len = strlen(command);
-  	int argc = 0;
-  	int ret;
+	char *args[3]; /* Название команды и не более двух аргументов. */
+	char *cursor = command;
+	char *token;
+	size_t len = strlen(command);
+	int argc = 0;
+	int ret;
 
-  	/* Неиспользуемые поля команды остаются нулевыми. */
-  	*parsed = (struct board_command){0};
+	/* Неиспользуемые поля команды остаются нулевыми. */
+	*parsed = (struct board_command){ 0 };
 
-  	/* Разрешаем один завершающий перевод строки от echo. */
-  	if (len && command[len - 1] == '\n')
-  		command[len - 1] = '\0';
+	/* Разрешаем один завершающий перевод строки от echo. */
+	if (len && command[len - 1] == '\n')
+		command[len - 1] = '\0';
 
-  	/* Оставшийся перевод строки означает недопустимый многострочный ввод. */
-  	if (strchr(command, '\n'))
-  		return -EINVAL;
+	/* Оставшийся перевод строки означает недопустимый многострочный ввод.
+	 */
+	if (strchr(command, '\n'))
+		return -EINVAL;
 
-  	while ((token = strsep(&cursor, " \t")) != NULL) {
-  		if (!*token)
-  			continue;
+	while ((token = strsep(&cursor, " \t")) != NULL) {
+		if (!*token)
+			continue;
 
-  		if (argc == 3)
-  			return -EINVAL;
+		if (argc == 3)
+			return -EINVAL;
 
-  		args[argc++] = token;
-  	}
+		args[argc++] = token;
+	}
 
-  	if (!argc)
-  		return -EINVAL;
+	if (!argc)
+		return -EINVAL;
 
-  	if (!strcmp(args[0], "temp")) {
-  		if (argc != 2)
-  			return -EINVAL;
+	if (!strcmp(args[0], "temp")) {
+		if (argc != 2)
+			return -EINVAL;
 
-  		parsed->type = VB_CMD_SET_TEMP;
-  		return kstrtoint(args[1], 10, &parsed->temperature_decic);
-  	}
+		parsed->type = VB_CMD_SET_TEMP;
+		return kstrtoint(args[1], 10, &parsed->temperature_decic);
+	}
 
-    if (!strcmp(args[0], "limits")) {
-  		if (argc != 3)
-  			return -EINVAL;
+	if (!strcmp(args[0], "limits")) {
+		if (argc != 3)
+			return -EINVAL;
 
-  		parsed->type = VB_CMD_SET_LIMITS;
+		parsed->type = VB_CMD_SET_LIMITS;
 
-  		ret = kstrtoint(args[1], 10, &parsed->low_decic);
-  		if (ret)
-  			return ret;
+		ret = kstrtoint(args[1], 10, &parsed->low_decic);
+		if (ret)
+			return ret;
 
-  		return kstrtoint(args[2], 10, &parsed->high_decic);
-  	}
+		return kstrtoint(args[2], 10, &parsed->high_decic);
+	}
 
-  	/* У start и stop аргументов быть не должно. */
-  	if (argc != 1)
-  		return -EINVAL;
+	/* У start и stop аргументов быть не должно. */
+	if (argc != 1)
+		return -EINVAL;
 
-  	if (!strcmp(args[0], "start"))
-  		parsed->type = VB_CMD_START;
-  	else if (!strcmp(args[0], "stop"))
-  		parsed->type = VB_CMD_STOP;
-  	else
-  		return -EINVAL;
+	if (!strcmp(args[0], "start"))
+		parsed->type = VB_CMD_START;
+	else if (!strcmp(args[0], "stop"))
+		parsed->type = VB_CMD_STOP;
+	else
+		return -EINVAL;
 
-  	return 0;
+	return 0;
+}
+
+/* Один вызов принимает одну полную команду и ждёт её выполнения. */
+static ssize_t vb_write(struct file *file, const char __user *user_buf,
+			size_t count, loff_t *ppos)
+{
+	char command[VB_COMMAND_MAX_LEN + 1];
+	struct board_command parsed;
+	int ret;
+
+	/* Пустая запись не создаёт заявку и не изменяет состояние. */
+	if (!count)
+		return 0;
+
+	ret = vb_copy_command(command, user_buf, count);
+	if (ret)
+		return ret;
+
+	ret = vb_parse_command(command, &parsed);
+	if (ret)
+		return ret;
+
+	/* В рабочую очередь передаётся команда в памяти ядра. */
+	ret = vb_submit_command(&parsed);
+	if (ret)
+		return ret;
+
+	/* Подтверждаем все исходные байты только после выполнения команды. */
+	return count;
 }
 
 /*
@@ -109,6 +139,7 @@ static int vb_parse_command(char *command, struct board_command *parsed)
  */
 static const struct file_operations vb_fops = {
 	.owner = THIS_MODULE,
+	.write = vb_write,
 };
 
 /* Регистрируем номер, файловые операции, класс и объект устройства. */

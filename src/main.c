@@ -14,27 +14,46 @@ static int __init vb_init(void)
 {
 	int ret;
 
-	/* Неверные параметры отклоняем до резервирования номера устройства. */
+	/* Неверные параметры отклоняем до выделения ресурсов. */
 	ret = vb_validate_params();
 	if (ret)
 		return ret;
 
-    /* Подготавливаем состояние и mutex до регистрации устройства. */
-    vb_board_init();
+	vb_board_init();
 
-	/* Продолжаем загрузку только после успешного получения ресурса. */
-	ret = vb_chardev_init();
+	/* Сокет готовим до появления работ, которые смогут отправлять кадры. */
+	ret = vb_can_init();
 	if (ret)
 		return ret;
 
+	ret = vb_worker_init();
+	if (ret)
+		goto err_can;
+
+	/* Доступ к устройству открываем после подготовки общих ресурсов. */
+	ret = vb_chardev_init();
+	if (ret)
+		goto err_worker;
+
 	pr_info("virtual_board: module loaded\n");
 	return 0;
+
+err_worker:
+	/* Регистрация устройства уже откатила свои ресурсы. */
+	vb_worker_exit();
+err_can:
+	/* Очередь либо не создана, либо уже завершена и освобождена. */
+	vb_can_exit();
+	return ret;
 }
 
 static void __exit vb_exit(void)
 {
-	/* Возвращаем ядру номер, полученный при успешной загрузке. */
 	vb_chardev_exit();
+
+	/* Сокет остаётся доступным до завершения всех работ очереди. */
+	vb_worker_exit();
+	vb_can_exit();
 
 	pr_info("virtual_board: module unloaded\n");
 }
