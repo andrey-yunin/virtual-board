@@ -29,7 +29,6 @@ static void vb_periodic_work(struct work_struct *work)
 {
 	struct board_ctx *ctx;
 	struct board_state snapshot;
-	int ret;
 
 	/* Ядро передаёт адрес tx_work, вложенного в контекст платы. */
 	ctx = container_of(work, struct board_ctx, tx_work);
@@ -43,9 +42,8 @@ static void vb_periodic_work(struct work_struct *work)
 	if (snapshot.state != VB_STATE_RUNNING)
 		return;
 
-	ret = vb_can_send_status(&snapshot);
-	if (ret)
-		pr_err("virtual_board: periodic CAN status failed: %d\n", ret);
+	/* Сообщение об ошибке и событие формируются внутри can.c. */
+	vb_can_send_status(&snapshot);
 }
 
 /*

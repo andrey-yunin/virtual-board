@@ -42,7 +42,6 @@ int vb_board_apply_command(const struct board_command *command)
 {
 	struct board_state next;
 	bool send_temp_event = false;
-	int can_ret;
 	int ret = 0;
 
 	mutex_lock(&board.state_lock);
@@ -167,11 +166,7 @@ int vb_board_apply_command(const struct board_command *command)
 	 * Ошибка CAN не отменяет уже применённую команду.
 	 */
 	if (send_temp_event) {
-		can_ret = vb_can_send_temp_event(&next);
-		if (can_ret)
-			pr_err(
-			    "virtual_board: CAN temperature event failed: %d\n",
-			    can_ret);
+		vb_can_send_temp_event(&next);
 	}
 	return ret;
 }

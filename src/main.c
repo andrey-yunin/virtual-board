@@ -42,13 +42,23 @@ static int __init vb_init(void)
 	if (ret)
 		goto err_worker;
 
+	/* Состояние и остальные интерфейсы готовы: публикуем сводку. */
+	ret = vb_proc_init();
+	if (ret) {
+		pr_err("virtual_board: proc init failed: %d\n", ret);
+		goto err_chardev;
+	}
+
 	vb_params_set_ready(true);
 
 	pr_info("virtual_board: module loaded\n");
 	return 0;
 
+err_chardev:
+	/* Proc не создан, но устройство и sysfs уже зарегистрированы. */
+	vb_chardev_exit();
 err_worker:
-	/* Регистрация устройства уже откатила свои ресурсы. */
+	/* Регистрации устройства уже удалены либо откачены при ошибке. */
 	vb_worker_exit();
 err_can:
 	/* Очередь либо не создана, либо уже завершена и освобождена. */
@@ -58,8 +68,11 @@ err_can:
 
 static void __exit vb_exit(void)
 {
-	/* Ждём текущий callback параметра и запрещаем новые команды sysfs. */
+	/* Запрещаем чтение параметров и ждём текущий callback. */
 	vb_params_set_ready(false);
+
+	/* Завершаем обращения к сводке до удаления остальных ресурсов. */
+	vb_proc_exit();
 	vb_chardev_exit();
 
 	/* Сокет остаётся доступным до завершения всех работ очереди. */

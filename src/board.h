@@ -246,6 +246,18 @@ int vb_chardev_init(void);
 /* Освобождает ресурсы после успешного vb_chardev_init(). */
 void vb_chardev_exit(void);
 
+/* Создаёт атрибуты уже зарегистрированного board.device. */
+int vb_sysfs_init(void);
+
+/* Удаляет атрибуты до уничтожения board.device. */
+void vb_sysfs_exit(void);
+
+/* Создаёт proc-файл для чтения сводки состояния и клиентов. */
+int vb_proc_init(void);
+
+/* Удаляет proc-файл и завершает обращения к его обработчикам. */
+void vb_proc_exit(void);
+
 /* Создаёт и настраивает CAN-сокет; возвращает 0 или код ошибки. */
 int vb_can_init(void);
 

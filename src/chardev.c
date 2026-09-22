@@ -243,9 +243,17 @@ int vb_chardev_init(void)
 		goto err_class;
 	}
 
+	/* Объект устройства уже существует: добавляем его атрибуты. */
+	ret = vb_sysfs_init();
+	if (ret) {
+		pr_err("virtual_board: sysfs init failed: %d\n", ret);
+		goto err_device;
+	}
 	return 0;
 
-	/* Каждая метка освобождает успешно полученные ранее ресурсы. */
+/* Каждая метка освобождает успешно полученные ранее ресурсы. */
+err_device:
+	device_destroy(board.class, board.devno);
 err_class:
 	class_destroy(board.class);
 err_cdev:
@@ -258,7 +266,8 @@ err_region:
 /* Вызывается только после успешной регистрации всех объектов. */
 void vb_chardev_exit(void)
 {
-	/* Сначала удаляем устройство, затем обеспечивавшие его объекты. */
+	/* Атрибуты удаляем, пока объект устройства ещё существует. */
+	vb_sysfs_exit();
 	device_destroy(board.class, board.devno);
 	class_destroy(board.class);
 	cdev_del(&board.cdev);

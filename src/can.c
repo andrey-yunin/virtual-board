@@ -3,6 +3,7 @@
 #include <linux/can/raw.h>
 #include <linux/errno.h>
 #include <linux/if_arp.h>
+#include <linux/mutex.h>
 #include <linux/net.h>
 #include <linux/netdevice.h>
 #include <linux/printk.h>
@@ -13,6 +14,44 @@
 #include <net/net_namespace.h>
 
 #include "board.h"
+
+/*
+ * Используется только последовательным рабочим потоком.
+ * 0 — после загрузки или после успешной отправки.
+ */
+static int vb_can_last_error;
+
+/*
+ * Обрабатывает результат отправки: 0 либо отрицательный код ошибки.
+ * Вызывается рабочим потоком без удержания board.state_lock.
+ */
+static void vb_can_handle_result(int error, const struct board_state *status)
+{
+	struct board_event event = {
+		.type = VB_EVENT_CAN_ERROR,
+		.snapshot = *status,
+		.error = error,
+	};
+
+	if (!error) {
+		/* После успеха следующий сбой снова требует уведомления. */
+		vb_can_last_error = 0;
+		return;
+	}
+
+	/* Продолжаем попытки отправки, но не повторяем уведомление. */
+	if (error == vb_can_last_error)
+		return;
+
+	vb_can_last_error = error;
+
+	pr_err("virtual_board: CAN send failed: %d\n", error);
+
+	/* Передаём копию события каждому существующему читателю. */
+	mutex_lock(&board.state_lock);
+	vb_clients_publish_locked(&event);
+	mutex_unlock(&board.state_lock);
+}
 
 /* Записываем снимок платы в общий формат статуса и уведомления. */
 static void vb_can_fill_frame(struct can_frame *frame, canid_t can_id,
@@ -81,14 +120,17 @@ static int vb_can_send_frame(canid_t can_id, const struct board_state *status)
 
 	/* SocketCAN получает всю структуру, а не только восемь байтов data. */
 	ret = kernel_sendmsg(board.can_sock, &msg, &iov, 1, sizeof(frame));
-	if (ret < 0)
-		return ret;
 
-	/* Частичный результат не подтверждает отправку полного кадра. */
-	if (ret != sizeof(frame))
-		return -EIO;
+	/*
+	 * Приводим результат к нашему контракту:
+	 * 0 — полный кадр принят стеком, отрицательное число — ошибка.
+	 */
+	if (ret >= 0)
+		ret = ret == sizeof(frame) ? 0 : -EIO;
 
-	return 0;
+	/* Ошибка и успех проходят через общий учёт результата. */
+	vb_can_handle_result(ret, status);
+	return ret;
 }
 
 /* Периодический статус и температурный переход имеют разные CAN ID. */
