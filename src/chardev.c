@@ -133,13 +133,74 @@ static ssize_t vb_write(struct file *file, const char __user *user_buf,
 }
 
 /*
+ * ioctl использует тот же контекст устройства и общую обработку команд.
+ * GET_STATUS читает снимок напрямую и не извлекает события из FIFO.
+ */
+static long vb_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+	void __user *user_arg = (void __user *)arg;
+	struct board_command command = { 0 };
+	struct vb_limits limits;
+	struct vb_period period;
+	struct vb_status status = { 0 };
+
+	/* Сравниваем полную команду, включая направление и размер аргумента. */
+	switch (cmd) {
+	case VB_IOC_GET_STATUS:
+		if (!(file->f_mode & FMODE_READ))
+			return -EBADF;
+		mutex_lock(&board.state_lock);
+		status.temperature_decic = board.status.temperature_decic;
+		status.low_decic = board.status.low_decic;
+		status.high_decic = board.status.high_decic;
+		status.period_ms = board.status.period_ms;
+		status.state = board.status.state;
+		status.temp_status = board.status.temp_status;
+		mutex_unlock(&board.state_lock);
+
+		if (copy_to_user(user_arg, &status, sizeof(status)))
+			return -EFAULT;
+		return 0;
+
+	case VB_IOC_SET_LIMITS:
+		if (!(file->f_mode & FMODE_WRITE))
+			return -EBADF;
+		if (copy_from_user(&limits, user_arg, sizeof(limits)))
+			return -EFAULT;
+		command.type = VB_CMD_SET_LIMITS;
+		command.low_decic = limits.low_decic;
+		command.high_decic = limits.high_decic;
+		break;
+
+	case VB_IOC_SET_PERIOD:
+		if (!(file->f_mode & FMODE_WRITE))
+			return -EBADF;
+		if (copy_from_user(&period, user_arg, sizeof(period)))
+			return -EFAULT;
+		command.type = VB_CMD_SET_PERIOD;
+		command.period_ms = period.period_ms;
+		break;
+
+	default:
+		return -ENOTTY;
+	}
+
+	/* Диапазоны, состояние и таймер проверяются в существующем worker. */
+	return vb_submit_command(&command);
+}
+
+/*
  * Таблица операций принадлежит нашему модулю.
  * Обработчики добавим по мере реализации; owner позволяет ядру
  * удерживать модуль, пока используются операции открытого устройства.
  */
 static const struct file_operations vb_fops = {
 	.owner = THIS_MODULE,
+	.open = vb_client_open,
+	.release = vb_client_release,
+	.read = vb_client_read,
 	.write = vb_write,
+	.unlocked_ioctl = vb_ioctl,
 };
 
 /* Регистрируем номер, файловые операции, класс и объект устройства. */

@@ -1,13 +1,19 @@
 #ifndef VIRTUAL_BOARD_H
 #define VIRTUAL_BOARD_H
 
+#include <linux/atomic.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
+#include <linux/fs.h>
 #include <linux/hrtimer.h>
+#include <linux/kfifo.h>
 #include <linux/ktime.h>
+#include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/net.h>
+#include <linux/pid.h>
 #include <linux/types.h>
+#include <linux/wait.h>
 #include <linux/workqueue.h>
 
 #include "../include/virtual_board_uapi.h"
@@ -23,10 +29,20 @@
 /* Максимум байтов в одной команде write, включая перевод строки. */
 #define VB_COMMAND_MAX_LEN 64
 
-/* Операции, которые пользователь может запросить через write. */
+/* Максимальное число одновременно существующих контекстов процессов. */
+#define VB_MAX_CLIENTS 8U
+
+/* Ёмкость персонального FIFO в записях struct board_event. */
+#define VB_EVENT_FIFO_CAPACITY 64U
+
+/* Буфер одной текстовой записи read, включая завершающий ноль. */
+#define VB_EVENT_LINE_MAX 256U
+
+/* Общие операции управления через write и ioctl. */
 enum vb_command_type {
 	VB_CMD_SET_TEMP,
 	VB_CMD_SET_LIMITS,
+	VB_CMD_SET_PERIOD,
 	VB_CMD_START,
 	VB_CMD_STOP,
 };
@@ -40,6 +56,7 @@ struct board_command {
 	int temperature_decic;
 	int low_decic;
 	int high_decic;
+	unsigned int period_ms;
 };
 
 /*
@@ -53,6 +70,70 @@ struct board_state {
 	unsigned int period_ms;
 	enum vb_state state;
 	enum vb_temp_status temp_status;
+};
+
+/* Причина появления записи в персональных очередях читателей. */
+enum vb_event_type {
+	VB_EVENT_TEMP_TRANSITION,
+	VB_EVENT_STARTED,
+	VB_EVENT_STOPPED,
+	VB_EVENT_CAN_ERROR,
+};
+
+/*
+ * Снимок одного события. Каждый подписанный процесс получает свою копию.
+ * Последующие изменения платы не изменяют уже сохранённую запись.
+ */
+struct board_event {
+	enum vb_event_type type;
+	struct board_state snapshot;
+
+	/* Для CAN_ERROR — отрицательный код ошибки; иначе 0. */
+	int error;
+};
+
+/*
+ * Общий контекст открытий одного процесса.
+ * Потоки и повторные открытия владельца используют один FIFO.
+ */
+struct board_client {
+	/* Связи в списке клиентов платы. */
+	struct list_head node;
+
+	/* Удерживаемая ссылка на идентификатор группы потоков владельца. */
+	struct pid *owner;
+
+	/*
+	 * Число открытых файловых объектов и читающих среди них.
+	 * dup не создаёт новый файловый объект.
+	 */
+	unsigned int opens;
+	unsigned int readers;
+
+	/* Защищает записи FIFO и счётчик потерь. */
+	struct mutex fifo_lock;
+
+	/* Хранилище событий выделим отдельно при создании клиента. */
+	DECLARE_KFIFO_PTR(fifo, struct board_event);
+
+	/* Число новых событий, отброшенных из-за заполнения FIFO. */
+	u64 lost_events;
+
+	/* Сериализует чтения и защищает строку с её текущей позицией. */
+	struct mutex read_lock;
+
+	/* Здесь читатели будут ждать появления доступных данных. */
+	wait_queue_head_t read_wait;
+
+	/* События в FIFO плюс событие с ещё не дочитанной строкой. */
+	atomic_t pending_events;
+
+	/* Сформированная строка остаётся здесь до полного прочтения. */
+	char read_buf[VB_EVENT_LINE_MAX];
+
+	/* Длина строки без завершающего нуля и число отданных байтов. */
+	size_t read_len;
+	size_t read_pos;
 };
 
 /*
@@ -81,8 +162,15 @@ struct board_ctx {
 	/* Защищает согласованное чтение и изменение текущего состояния. */
 	struct mutex state_lock;
 
-	/* Рабочие значения; при загрузке получат проверенные параметры. */
+	/* Единственное хранилище текущих значений, включая параметры модуля. */
 	struct board_state status;
+
+	/*
+	 * Контексты процессов, открывших устройство.
+	 * Список и число клиентов защищает state_lock.
+	 */
+	struct list_head clients;
+	unsigned int client_count;
 
 	/* Выделенный номер major/minor; тот же номер будет у узла в /dev. */
 	dev_t devno;
@@ -119,10 +207,6 @@ extern struct board_ctx board;
  */
 extern char can_iface[]; /* Имя CAN-интерфейса из параметров загрузки; массив
 			    определён в params.c. */
-extern int temperature_decic;
-extern int low_decic;
-extern int high_decic;
-extern unsigned int period_ms;
 
 /* Подготавливает mutex и состояние платы после проверки параметров. */
 void vb_board_init(void);
@@ -141,6 +225,20 @@ void vb_worker_exit(void);
 
 /* Возвращает 0 при допустимых параметрах или отрицательный код ошибки. */
 int vb_validate_params(void);
+
+/* Разрешает/запрещает чтение параметров из готового состояния платы. */
+void vb_params_set_ready(bool ready);
+
+/* Связывает открытие с контекстом процесса и учитывает его закрытие. */
+int vb_client_open(struct inode *inode, struct file *file);
+int vb_client_release(struct inode *inode, struct file *file);
+
+/* Читает событие или остаток ранее сформированной строки. */
+ssize_t vb_client_read(struct file *file, char __user *user_buf, size_t count,
+		       loff_t *ppos);
+
+/* Копирует событие читателям; вызывающий удерживает board.state_lock. */
+void vb_clients_publish_locked(const struct board_event *event);
 
 /* Подготавливает символьное устройство; возвращает 0 или код ошибки. */
 int vb_chardev_init(void);

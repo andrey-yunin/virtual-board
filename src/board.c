@@ -23,12 +23,9 @@ void vb_board_init(void)
 	/* Подготавливаем блокировку до появления параллельных обращений. */
 	mutex_init(&board.state_lock);
 
-	/* Копируем числа из параметров загрузки в отдельное рабочее состояние.
-	 */
-	board.status.temperature_decic = temperature_decic;
-	board.status.low_decic = low_decic;
-	board.status.high_decic = high_decic;
-	board.status.period_ms = period_ms;
+	/* До первого открытия список пуст, контексты ещё не выделены. */
+	INIT_LIST_HEAD(&board.clients);
+	board.client_count = 0;
 
 	/* Передача после загрузки выключена независимо от температуры. */
 	board.status.state = VB_STATE_STOPPED;
@@ -63,21 +60,34 @@ int vb_board_apply_command(const struct board_command *command)
 		break;
 
 	case VB_CMD_SET_LIMITS:
-		if (command->low_decic < VB_TEMP_MIN_DECIC ||
-		    command->low_decic > VB_TEMP_MAX_DECIC ||
-		    command->high_decic < VB_TEMP_MIN_DECIC ||
-		    command->high_decic > VB_TEMP_MAX_DECIC) {
+		/* Оба предела проверяем и применяем как одну операцию. */
+		next.low_decic = command->low_decic;
+		next.high_decic = command->high_decic;
+
+		if (next.low_decic < VB_TEMP_MIN_DECIC ||
+		    next.low_decic > VB_TEMP_MAX_DECIC ||
+		    next.high_decic < VB_TEMP_MIN_DECIC ||
+		    next.high_decic > VB_TEMP_MAX_DECIC) {
 			ret = -ERANGE;
 			break;
 		}
-
-		if (command->low_decic >= command->high_decic) {
+		if (next.low_decic >= next.high_decic)
 			ret = -EINVAL;
+		break;
+
+	case VB_CMD_SET_PERIOD:
+		if (command->period_ms < VB_PERIOD_MIN_MS ||
+		    command->period_ms > VB_PERIOD_MAX_MS) {
+			ret = -ERANGE;
 			break;
 		}
-
-		next.low_decic = command->low_decic;
-		next.high_decic = command->high_decic;
+		/* Callback читает интервал: меняем его после отмены таймера. */
+		hrtimer_cancel(&board.tx_timer);
+		next.period_ms = command->period_ms;
+		board.tx_interval = ms_to_ktime(next.period_ms);
+		if (next.state == VB_STATE_RUNNING)
+			hrtimer_start(&board.tx_timer, board.tx_interval,
+				      HRTIMER_MODE_REL);
 		break;
 
 	case VB_CMD_START:
@@ -110,18 +120,39 @@ int vb_board_apply_command(const struct board_command *command)
 	}
 
 	if (!ret) {
-		/* Пересчитываем статус и сохраняем все поля под одной
-		 * блокировкой. */
+		struct board_event event = { 0 };
+		bool state_changed;
+		bool temp_changed;
+
 		next.temp_status = vb_calc_temp_status(&next);
 
-		/* Сравниваем с прежним статусом до его перезаписи. */
-		send_temp_event = next.state == VB_STATE_RUNNING &&
-				  next.temp_status != board.status.temp_status;
+		/* Сравниваем до перезаписи прежнего состояния. */
+		state_changed = next.state != board.status.state;
+		temp_changed = next.temp_status != board.status.temp_status;
+
+		send_temp_event =
+		    next.state == VB_STATE_RUNNING && temp_changed;
 
 		board.status = next;
 
-		/* Позволяет проверить результат до реализации интерфейсов
-		 * чтения. */
+		/* Сохраняем значения события, а не адрес изменяемой платы. */
+		event.snapshot = next;
+
+		if (state_changed) {
+			if (next.state == VB_STATE_RUNNING)
+				event.type = VB_EVENT_STARTED;
+			else
+				event.type = VB_EVENT_STOPPED;
+
+			vb_clients_publish_locked(&event);
+		}
+
+		/* Локальный контроль действует и при остановленной передаче. */
+		if (temp_changed) {
+			event.type = VB_EVENT_TEMP_TRANSITION;
+			vb_clients_publish_locked(&event);
+		}
+
 		pr_info(
 		    "virtual_board: temp=%d low=%d high=%d temp_status=%u\n",
 		    next.temperature_decic, next.low_decic, next.high_decic,

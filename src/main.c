@@ -6,9 +6,16 @@
 
 /*
  * Единственный контекст платы хранится в памяти загруженного модуля.
- * Изначально поля нулевые; объекты регистрации подготовим отдельно.
+ * Значения по умолчанию сразу хранятся в рабочем состоянии.
  */
-struct board_ctx board;
+struct board_ctx board = {
+	.status = {
+		.temperature_decic = 250,
+		.low_decic = 100,
+		.high_decic = 700,
+		.period_ms = 100,
+	},
+};
 
 static int __init vb_init(void)
 {
@@ -35,6 +42,8 @@ static int __init vb_init(void)
 	if (ret)
 		goto err_worker;
 
+	vb_params_set_ready(true);
+
 	pr_info("virtual_board: module loaded\n");
 	return 0;
 
@@ -49,6 +58,8 @@ err_can:
 
 static void __exit vb_exit(void)
 {
+	/* Ждём текущий callback параметра и запрещаем новые команды sysfs. */
+	vb_params_set_ready(false);
 	vb_chardev_exit();
 
 	/* Сокет остаётся доступным до завершения всех работ очереди. */
